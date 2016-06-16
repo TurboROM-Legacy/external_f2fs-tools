@@ -218,7 +218,7 @@ static void do_fsck(struct f2fs_sb_info *sbi)
 	/* Traverse all block recursively from root inode */
 	blk_cnt = 1;
 	fsck_chk_node_blk(sbi, NULL, sbi->root_ino_num, (u8 *)"/",
-			F2FS_FT_DIR, TYPE_INODE, &blk_cnt, NULL, NULL);
+			F2FS_FT_DIR, TYPE_INODE, &blk_cnt, NULL);
 	fsck_verify(sbi);
 	fsck_free(sbi);
 }
@@ -330,8 +330,13 @@ fsck_again:
 	sbi = &gfsck.sbi;
 
 	ret = f2fs_do_mount(sbi);
-	if (ret != 0)
+	if (ret != 0) {
+		if (ret == 1) {
+			MSG(0, "Info: No error was reported\n");
+			ret = 0;
+		}
 		goto out_err;
+	}
 
 	switch (config.func) {
 	case FSCK:
@@ -341,7 +346,8 @@ fsck_again:
 		do_dump(sbi);
 		break;
 	case DEFRAG:
-		if (do_defrag(sbi))
+		ret = do_defrag(sbi);
+		if (ret)
 			goto out_err;
 		break;
 	}
@@ -376,5 +382,5 @@ out_err:
 		free(sbi->ckpt);
 	if (sbi->raw_super)
 		free(sbi->raw_super);
-	return -1;
+	return ret;
 }

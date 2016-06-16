@@ -94,7 +94,7 @@ int utf8_to_utf16(u_int16_t *output, const char *input, size_t outsize,
 	u_int16_t *outp = output;
 	wchar_t wc;
 
-	while (inp - input < insize && *inp) {
+	while ((size_t)(inp - input) < insize && *inp) {
 		inp = utf8_to_wchar(inp, &wc, insize - (inp - input));
 		if (inp == NULL) {
 			DBG(0, "illegal UTF-8 sequence\n");
@@ -180,7 +180,7 @@ int utf16_to_utf8(char *output, const u_int16_t *input, size_t outsize,
 	char *outp = output;
 	wchar_t wc;
 
-	while (inp - input < insize && le16_to_cpu(*inp)) {
+	while ((size_t)(inp - input) < insize && le16_to_cpu(*inp)) {
 		inp = utf16_to_wchar(inp, &wc, insize - (inp - input));
 		if (inp == NULL) {
 			DBG(0, "illegal UTF-16 sequence\n");
@@ -503,8 +503,7 @@ void f2fs_init_configuration(struct f2fs_configuration *c)
 	c->ro = 0;
 }
 
-static int is_mounted(struct f2fs_configuration *c,
-				const char *mpt, const char *device)
+static int is_mounted(const char *mpt, const char *device)
 {
 	FILE *file = NULL;
 	struct mntent *mnt = NULL;
@@ -515,8 +514,10 @@ static int is_mounted(struct f2fs_configuration *c,
 
 	while ((mnt = getmntent(file)) != NULL) {
 		if (!strcmp(device, mnt->mnt_fsname)) {
+#ifdef MNTOPT_RO
 			if (hasmntopt(mnt, MNTOPT_RO))
 				config.ro = 1;
+#endif
 			break;
 		}
 	}
@@ -529,17 +530,17 @@ int f2fs_dev_is_umounted(struct f2fs_configuration *c)
 	struct stat st_buf;
 	int ret = 0;
 
-	ret = is_mounted(c, MOUNTED, c->device_name);
+	/*
+	 * try with /proc/mounts fist to detect RDONLY.
+	 * f2fs_stop_checkpoint makes RO in /proc/mounts while RW in /etc/mtab.
+	 */
+	ret = is_mounted("/proc/mounts", c->device_name);
 	if (ret) {
 		MSG(0, "Info: Mounted device!\n");
 		return -1;
 	}
 
-	/*
-	 * if failed due to /etc/mtab file not present
-	 * try with /proc/mounts.
-	 */
-	ret = is_mounted(c, "/proc/mounts", c->device_name);
+	ret = is_mounted(MOUNTED, c->device_name);
 	if (ret) {
 		MSG(0, "Info: Mounted device!\n");
 		return -1;
@@ -638,6 +639,11 @@ int f2fs_get_device_info(struct f2fs_configuration *c)
 					c->total_sectors, c->sector_size);
 		c->total_sectors = wanted_total_sectors;
 
+	}
+	if (c->total_sectors * c->sector_size >
+		(u_int64_t)F2FS_MAX_SEGMENT * 2 * 1024 * 1024) {
+		MSG(0, "\tError: F2FS can support 16TB at most!!!\n");
+		return -1;
 	}
 	MSG(0, "Info: sector size = %u\n", c->sector_size);
 	MSG(0, "Info: total sectors = %"PRIu64" (%"PRIu64" MB)\n",

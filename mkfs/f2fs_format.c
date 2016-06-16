@@ -126,7 +126,8 @@ static int f2fs_prepare_super_block(void)
 	u_int32_t sit_segments;
 	u_int32_t blocks_for_sit, blocks_for_nat, blocks_for_ssa;
 	u_int32_t total_valid_blks_available;
-	u_int64_t zone_align_start_offset, diff, total_meta_segments;
+	u_int64_t zone_align_start_offset, diff;
+	u_int64_t total_meta_zones, total_meta_segments;
 	u_int32_t sit_bitmap_size, max_sit_bitmap_size;
 	u_int32_t max_nat_bitmap_size, max_nat_segments;
 	u_int32_t total_zones;
@@ -174,7 +175,8 @@ static int f2fs_prepare_super_block(void)
 	}
 
 	set_sb(segment_count, (config.total_sectors * config.sector_size -
-				zone_align_start_offset) / segment_size_bytes);
+				zone_align_start_offset) / segment_size_bytes /
+				config.segs_per_zone * config.segs_per_zone);
 
 	set_sb(segment0_blkaddr, zone_align_start_offset / blk_size_bytes);
 	sb->cp_blkaddr = sb->segment0_blkaddr;
@@ -259,16 +261,16 @@ static int f2fs_prepare_super_block(void)
 		set_sb(segment_count_ssa, get_sb(segment_count_ssa) +
 			(config.segs_per_zone - diff));
 
-	set_sb(main_blkaddr, get_sb(ssa_blkaddr) + get_sb(segment_count_ssa) *
-			 config.blks_per_seg);
+	total_meta_zones = ZONE_ALIGN(total_meta_segments *
+						config.blks_per_seg);
 
-	set_sb(segment_count_main, get_sb(segment_count) -
-			(get_sb(segment_count_ckpt) +
-			 get_sb(segment_count_sit) +
-			 get_sb(segment_count_nat) +
-			 get_sb(segment_count_ssa)));
+	set_sb(main_blkaddr, get_sb(segment0_blkaddr) + total_meta_zones *
+				config.segs_per_zone * config.blks_per_seg);
 
-	set_sb(section_count, get_sb(segment_count_main) / config.segs_per_sec);
+	total_zones = get_sb(segment_count) / (config.segs_per_zone) -
+							total_meta_zones;
+
+	set_sb(section_count, total_zones * config.secs_per_zone);
 
 	set_sb(segment_count_main, get_sb(section_count) * config.segs_per_sec);
 
@@ -297,7 +299,6 @@ static int f2fs_prepare_super_block(void)
 	set_sb(meta_ino, 2);
 	set_sb(root_ino, 3);
 
-	total_zones = get_sb(segment_count_main) / (config.segs_per_zone);
 	if (total_zones <= 6) {
 		MSG(1, "\tError: %d zones: Need more zones \
 			by shrinking zone size\n", total_zones);
@@ -410,6 +411,7 @@ static int f2fs_init_nat_area(void)
 static int f2fs_write_check_point_pack(void)
 {
 	struct f2fs_summary_block *sum = NULL;
+	struct f2fs_journal *journal;
 	u_int32_t blk_size_bytes;
 	u_int64_t cp_seg_blk_offset = 0;
 	u_int32_t crc = 0;
@@ -532,38 +534,39 @@ static int f2fs_write_check_point_pack(void)
 	memset(sum, 0, sizeof(struct f2fs_summary_block));
 	SET_SUM_TYPE((&sum->footer), SUM_TYPE_DATA);
 
-	sum->n_nats = cpu_to_le16(1);
-	sum->nat_j.entries[0].nid = sb->root_ino;
-	sum->nat_j.entries[0].ne.version = 0;
-	sum->nat_j.entries[0].ne.ino = sb->root_ino;
-	sum->nat_j.entries[0].ne.block_addr = cpu_to_le32(
+	journal = &sum->journal;
+	journal->n_nats = cpu_to_le16(1);
+	journal->nat_j.entries[0].nid = sb->root_ino;
+	journal->nat_j.entries[0].ne.version = 0;
+	journal->nat_j.entries[0].ne.ino = sb->root_ino;
+	journal->nat_j.entries[0].ne.block_addr = cpu_to_le32(
 			get_sb(main_blkaddr) +
 			get_cp(cur_node_segno[0]) * config.blks_per_seg);
 
-	memcpy(sum_compact_p, &sum->n_nats, SUM_JOURNAL_SIZE);
+	memcpy(sum_compact_p, &journal->n_nats, SUM_JOURNAL_SIZE);
 	sum_compact_p += SUM_JOURNAL_SIZE;
 
 	memset(sum, 0, sizeof(struct f2fs_summary_block));
 	/* inode sit for root */
-	sum->n_sits = cpu_to_le16(6);
-	sum->sit_j.entries[0].segno = cp->cur_node_segno[0];
-	sum->sit_j.entries[0].se.vblocks = cpu_to_le16((CURSEG_HOT_NODE << 10) | 1);
-	f2fs_set_bit(0, (char *)sum->sit_j.entries[0].se.valid_map);
-	sum->sit_j.entries[1].segno = cp->cur_node_segno[1];
-	sum->sit_j.entries[1].se.vblocks = cpu_to_le16((CURSEG_WARM_NODE << 10));
-	sum->sit_j.entries[2].segno = cp->cur_node_segno[2];
-	sum->sit_j.entries[2].se.vblocks = cpu_to_le16((CURSEG_COLD_NODE << 10));
+	journal->n_sits = cpu_to_le16(6);
+	journal->sit_j.entries[0].segno = cp->cur_node_segno[0];
+	journal->sit_j.entries[0].se.vblocks = cpu_to_le16((CURSEG_HOT_NODE << 10) | 1);
+	f2fs_set_bit(0, (char *)journal->sit_j.entries[0].se.valid_map);
+	journal->sit_j.entries[1].segno = cp->cur_node_segno[1];
+	journal->sit_j.entries[1].se.vblocks = cpu_to_le16((CURSEG_WARM_NODE << 10));
+	journal->sit_j.entries[2].segno = cp->cur_node_segno[2];
+	journal->sit_j.entries[2].se.vblocks = cpu_to_le16((CURSEG_COLD_NODE << 10));
 
 	/* data sit for root */
-	sum->sit_j.entries[3].segno = cp->cur_data_segno[0];
-	sum->sit_j.entries[3].se.vblocks = cpu_to_le16((CURSEG_HOT_DATA << 10) | 1);
-	f2fs_set_bit(0, (char *)sum->sit_j.entries[3].se.valid_map);
-	sum->sit_j.entries[4].segno = cp->cur_data_segno[1];
-	sum->sit_j.entries[4].se.vblocks = cpu_to_le16((CURSEG_WARM_DATA << 10));
-	sum->sit_j.entries[5].segno = cp->cur_data_segno[2];
-	sum->sit_j.entries[5].se.vblocks = cpu_to_le16((CURSEG_COLD_DATA << 10));
+	journal->sit_j.entries[3].segno = cp->cur_data_segno[0];
+	journal->sit_j.entries[3].se.vblocks = cpu_to_le16((CURSEG_HOT_DATA << 10) | 1);
+	f2fs_set_bit(0, (char *)journal->sit_j.entries[3].se.valid_map);
+	journal->sit_j.entries[4].segno = cp->cur_data_segno[1];
+	journal->sit_j.entries[4].se.vblocks = cpu_to_le16((CURSEG_WARM_DATA << 10));
+	journal->sit_j.entries[5].segno = cp->cur_data_segno[2];
+	journal->sit_j.entries[5].se.vblocks = cpu_to_le16((CURSEG_COLD_DATA << 10));
 
-	memcpy(sum_compact_p, &sum->n_sits, SUM_JOURNAL_SIZE);
+	memcpy(sum_compact_p, &journal->n_sits, SUM_JOURNAL_SIZE);
 	sum_compact_p += SUM_JOURNAL_SIZE;
 
 	/* hot data summary */
@@ -697,6 +700,7 @@ static int f2fs_write_super_block(void)
 	return 0;
 }
 
+#ifndef WITH_ANDROID
 static int discard_obsolete_dnode(struct f2fs_node *raw_node, u_int64_t offset)
 {
 	do {
@@ -709,8 +713,7 @@ static int discard_obsolete_dnode(struct f2fs_node *raw_node, u_int64_t offset)
 			return -1;
 		}
 
-		if (le64_to_cpu(raw_node->footer.cp_ver) == 1)
-			raw_node->footer.cp_ver = 0;
+		memset(raw_node, 0, F2FS_BLKSIZE);
 
 		DBG(1, "\tDiscard dnode, at offset 0x%08"PRIx64"\n", offset);
 		if (dev_write_block(raw_node, offset)) {
@@ -722,6 +725,7 @@ static int discard_obsolete_dnode(struct f2fs_node *raw_node, u_int64_t offset)
 
 	return 0;
 }
+#endif
 
 static int f2fs_write_root_inode(void)
 {
@@ -789,10 +793,12 @@ static int f2fs_write_root_inode(void)
 	main_area_node_seg_blk_offset += config.cur_seg[CURSEG_WARM_NODE] *
 					config.blks_per_seg;
 
+#ifndef WITH_ANDROID
 	if (discard_obsolete_dnode(raw_node, main_area_node_seg_blk_offset)) {
 		free(raw_node);
 		return -1;
 	}
+#endif
 
 	free(raw_node);
 	return 0;
