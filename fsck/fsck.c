@@ -174,7 +174,7 @@ static int is_valid_ssa_node_blk(struct f2fs_sb_info *sbi, u32 nid,
 			need_fix = 1;
 		}
 	}
-	if (need_fix) {
+	if (need_fix && !config.ro) {
 		u64 ssa_blk;
 		int ret2;
 
@@ -289,7 +289,7 @@ static int is_valid_ssa_data_blk(struct f2fs_sb_info *sbi, u32 blk_addr,
 			need_fix = 1;
 		}
 	}
-	if (need_fix) {
+	if (need_fix && !config.ro) {
 		u64 ssa_blk;
 		int ret2;
 
@@ -468,7 +468,8 @@ out:
 
 int fsck_chk_node_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 		u32 nid, u8 *name, enum FILE_TYPE ftype, enum NODE_TYPE ntype,
-		u32 *blk_cnt, struct child_info *child)
+		u32 *blk_cnt, struct child_info *child,
+		struct extent_info *i_ext)
 {
 	struct node_info ni;
 	struct f2fs_node *node_blk = NULL;
@@ -487,19 +488,19 @@ int fsck_chk_node_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 			f2fs_set_main_bitmap(sbi, ni.blk_addr,
 							CURSEG_WARM_NODE);
 			fsck_chk_dnode_blk(sbi, inode, nid, ftype, node_blk,
-					blk_cnt, child, &ni);
+					blk_cnt, child, &ni, i_ext);
 			break;
 		case TYPE_INDIRECT_NODE:
 			f2fs_set_main_bitmap(sbi, ni.blk_addr,
 							CURSEG_COLD_NODE);
 			fsck_chk_idnode_blk(sbi, inode, ftype, node_blk,
-					blk_cnt, child);
+					blk_cnt, child, i_ext);
 			break;
 		case TYPE_DOUBLE_INDIRECT_NODE:
 			f2fs_set_main_bitmap(sbi, ni.blk_addr,
 							CURSEG_COLD_NODE);
 			fsck_chk_didnode_blk(sbi, inode, ftype, node_blk,
-					blk_cnt, child);
+					blk_cnt, child, i_ext);
 			break;
 		default:
 			ASSERT(0);
@@ -512,6 +513,26 @@ err:
 	return -EINVAL;
 }
 
+static void update_i_extent(struct extent_info *i_ext, block_t blkaddr)
+{
+	block_t end_addr;
+
+	if (!i_ext)
+		return;
+
+	end_addr = i_ext->ext.blk_addr + i_ext->ext.len;
+
+	/* TODO: check its file offset later */
+	if (blkaddr >= i_ext->ext.blk_addr && blkaddr < end_addr) {
+		unsigned int offset = blkaddr - i_ext->ext.blk_addr;
+
+		if (f2fs_set_bit(offset, i_ext->map))
+			i_ext->fail = 1;
+		else
+			i_ext->len--;
+	}
+}
+
 /* start with valid nid and blkaddr */
 void fsck_chk_inode_blk(struct f2fs_sb_info *sbi, u32 nid,
 		enum FILE_TYPE ftype, struct f2fs_node *node_blk,
@@ -522,6 +543,7 @@ void fsck_chk_inode_blk(struct f2fs_sb_info *sbi, u32 nid,
 	enum NODE_TYPE ntype;
 	u32 i_links = le32_to_cpu(node_blk->i.i_links);
 	u64 i_blocks = le64_to_cpu(node_blk->i.i_blocks);
+	struct extent_info i_extent;
 	unsigned int idx = 0;
 	int need_fix = 0;
 	int ret;
@@ -619,16 +641,28 @@ void fsck_chk_inode_blk(struct f2fs_sb_info *sbi, u32 nid,
 		}
 	}
 
+	i_extent.ext = node_blk->i.i_ext;
+	i_extent.len = le32_to_cpu(i_extent.ext.len);
+	i_extent.fail = 0;
+	if (i_extent.len) {
+		/* max 126KB */
+		i_extent.map = calloc(i_extent.len, 1);
+		ASSERT(i_extent.map != NULL);
+	}
+
 	/* check data blocks in inode */
 	for (idx = 0; idx < ADDRS_PER_INODE(&node_blk->i); idx++) {
-		if (le32_to_cpu(node_blk->i.i_addr[idx]) != 0) {
+		block_t blkaddr = le32_to_cpu(node_blk->i.i_addr[idx]);
+
+		if (blkaddr != 0) {
 			ret = fsck_chk_data_blk(sbi,
-					le32_to_cpu(node_blk->i.i_addr[idx]),
+					blkaddr,
 					&child, (i_blocks == *blk_cnt),
 					ftype, nid, idx, ni->version,
 					file_is_encrypt(node_blk->i.i_advise));
 			if (!ret) {
 				*blk_cnt = *blk_cnt + 1;
+				update_i_extent(&i_extent, blkaddr);
 			} else if (config.fix_on) {
 				node_blk->i.i_addr[idx] = 0;
 				need_fix = 1;
@@ -639,6 +673,8 @@ void fsck_chk_inode_blk(struct f2fs_sb_info *sbi, u32 nid,
 
 	/* check node blocks in inode */
 	for (idx = 0; idx < 5; idx++) {
+		block_t blkaddr = le32_to_cpu(node_blk->i.i_nid[idx]);
+
 		if (idx == 0 || idx == 1)
 			ntype = TYPE_DIRECT_NODE;
 		else if (idx == 2 || idx == 3)
@@ -648,10 +684,11 @@ void fsck_chk_inode_blk(struct f2fs_sb_info *sbi, u32 nid,
 		else
 			ASSERT(0);
 
-		if (le32_to_cpu(node_blk->i.i_nid[idx]) != 0) {
+		if (blkaddr != 0) {
 			ret = fsck_chk_node_blk(sbi, &node_blk->i,
-					le32_to_cpu(node_blk->i.i_nid[idx]),
-					NULL, ftype, ntype, blk_cnt, &child);
+					blkaddr,
+					NULL, ftype, ntype, blk_cnt, &child,
+					&i_extent);
 			if (!ret) {
 				*blk_cnt = *blk_cnt + 1;
 			} else if (config.fix_on) {
@@ -660,6 +697,12 @@ void fsck_chk_inode_blk(struct f2fs_sb_info *sbi, u32 nid,
 				FIX_MSG("[0x%x] i_nid[%d] = 0", nid, idx);
 			}
 		}
+	}
+	if (i_extent.len || i_extent.fail) {
+		ASSERT_MSG("ino: 0x%x has wrong ext: untouched=%d, overlap=%d",
+					nid, i_extent.len, i_extent.fail);
+		if (config.fix_on)
+			need_fix = 1;
 	}
 check:
 	if (i_blocks != *blk_cnt) {
@@ -719,7 +762,7 @@ skip_blkcnt_fix:
 					nid, i_links);
 		}
 	}
-	if (need_fix) {
+	if (need_fix && !config.ro) {
 		/* drop extent information to avoid potential wrong access */
 		node_blk->i.i_ext.len = 0;
 		ret = dev_write_block(node_blk, ni->blk_addr);
@@ -729,28 +772,32 @@ skip_blkcnt_fix:
 
 int fsck_chk_dnode_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 		u32 nid, enum FILE_TYPE ftype, struct f2fs_node *node_blk,
-		u32 *blk_cnt, struct child_info *child, struct node_info *ni)
+		u32 *blk_cnt, struct child_info *child, struct node_info *ni,
+		struct extent_info *i_ext)
 {
 	int idx, ret;
 	int need_fix = 0;
 
 	for (idx = 0; idx < ADDRS_PER_BLOCK; idx++) {
-		if (le32_to_cpu(node_blk->dn.addr[idx]) == 0x0)
+		block_t blkaddr = le32_to_cpu(node_blk->dn.addr[idx]);
+
+		if (blkaddr == 0x0)
 			continue;
 		ret = fsck_chk_data_blk(sbi,
-			le32_to_cpu(node_blk->dn.addr[idx]),
-			child, le64_to_cpu(inode->i_blocks) == *blk_cnt, ftype,
+			blkaddr, child,
+			le64_to_cpu(inode->i_blocks) == *blk_cnt, ftype,
 			nid, idx, ni->version,
 			file_is_encrypt(inode->i_advise));
 		if (!ret) {
 			*blk_cnt = *blk_cnt + 1;
+			update_i_extent(i_ext, blkaddr);
 		} else if (config.fix_on) {
 			node_blk->dn.addr[idx] = 0;
 			need_fix = 1;
 			FIX_MSG("[0x%x] dn.addr[%d] = 0", nid, idx);
 		}
 	}
-	if (need_fix) {
+	if (need_fix && !config.ro) {
 		ret = dev_write_block(node_blk, ni->blk_addr);
 		ASSERT(ret >= 0);
 	}
@@ -759,7 +806,7 @@ int fsck_chk_dnode_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 
 int fsck_chk_idnode_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 		enum FILE_TYPE ftype, struct f2fs_node *node_blk, u32 *blk_cnt,
-		struct child_info *child)
+		struct child_info *child, struct extent_info *i_ext)
 {
 	int ret;
 	int i = 0;
@@ -769,7 +816,8 @@ int fsck_chk_idnode_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 			continue;
 		ret = fsck_chk_node_blk(sbi, inode,
 				le32_to_cpu(node_blk->in.nid[i]), NULL,
-				ftype, TYPE_DIRECT_NODE, blk_cnt, child);
+				ftype, TYPE_DIRECT_NODE, blk_cnt, child,
+				i_ext);
 		if (!ret)
 			*blk_cnt = *blk_cnt + 1;
 		else if (ret == -EINVAL)
@@ -780,7 +828,7 @@ int fsck_chk_idnode_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 
 int fsck_chk_didnode_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 		enum FILE_TYPE ftype, struct f2fs_node *node_blk, u32 *blk_cnt,
-		struct child_info *child)
+		struct child_info *child, struct extent_info *i_ext)
 {
 	int i = 0;
 	int ret = 0;
@@ -790,7 +838,8 @@ int fsck_chk_didnode_blk(struct f2fs_sb_info *sbi, struct f2fs_inode *inode,
 			continue;
 		ret = fsck_chk_node_blk(sbi, inode,
 				le32_to_cpu(node_blk->in.nid[i]), NULL,
-				ftype, TYPE_INDIRECT_NODE, blk_cnt, child);
+				ftype, TYPE_INDIRECT_NODE, blk_cnt, child,
+				i_ext);
 		if (!ret)
 			*blk_cnt = *blk_cnt + 1;
 		else if (ret == -EINVAL)
@@ -820,8 +869,7 @@ static void convert_encrypted_name(unsigned char *name, int len,
 }
 
 static void print_dentry(__u32 depth, __u8 *name,
-		unsigned long *bitmap,
-		struct f2fs_dir_entry *dentry,
+		u8 *bitmap, struct f2fs_dir_entry *dentry,
 		int max, int idx, int last_blk, int encrypted)
 {
 	int last_de = 0;
@@ -837,13 +885,15 @@ static void print_dentry(__u32 depth, __u8 *name,
 	name_len = le16_to_cpu(dentry[idx].name_len);
 	next_idx = idx + (name_len + F2FS_SLOT_LEN - 1) / F2FS_SLOT_LEN;
 
-	bit_offset = find_next_bit(bitmap, max, next_idx);
+	bit_offset = find_next_bit_le(bitmap, max, next_idx);
 	if (bit_offset >= max && last_blk)
 		last_de = 1;
 
 	if (tree_mark_size <= depth) {
 		tree_mark_size *= 2;
+		ASSERT(tree_mark_size != 0);
 		tree_mark = realloc(tree_mark, tree_mark_size);
+		ASSERT(tree_mark != NULL);
 	}
 
 	if (last_de)
@@ -886,8 +936,7 @@ static int f2fs_check_hash_code(struct f2fs_dir_entry *dentry,
 }
 
 static int __chk_dentries(struct f2fs_sb_info *sbi, struct child_info *child,
-			unsigned long *bitmap,
-			struct f2fs_dir_entry *dentry,
+			u8 *bitmap, struct f2fs_dir_entry *dentry,
 			__u8 (*filenames)[F2FS_SLOT_LEN],
 			int max, int last_blk, int encrypted)
 {
@@ -904,7 +953,7 @@ static int __chk_dentries(struct f2fs_sb_info *sbi, struct child_info *child,
 
 	/* readahead inode blocks */
 	for (i = 0; i < max; i++) {
-		if (test_bit(i, bitmap) == 0)
+		if (test_bit_le(i, bitmap) == 0)
 			continue;
 
 		ino = le32_to_cpu(dentry[i].ino);
@@ -924,7 +973,7 @@ static int __chk_dentries(struct f2fs_sb_info *sbi, struct child_info *child,
 	}
 
 	for (i = 0; i < max;) {
-		if (test_bit(i, bitmap) == 0) {
+		if (test_bit_le(i, bitmap) == 0) {
 			i++;
 			continue;
 		}
@@ -934,7 +983,7 @@ static int __chk_dentries(struct f2fs_sb_info *sbi, struct child_info *child,
 			if (config.fix_on) {
 				FIX_MSG("Clear bad dentry 0x%x with bad ino 0x%x",
 					i, le32_to_cpu(dentry[i].ino));
-				clear_bit(i, bitmap);
+				test_and_clear_bit_le(i, bitmap);
 				fixed = 1;
 			}
 			i++;
@@ -943,11 +992,11 @@ static int __chk_dentries(struct f2fs_sb_info *sbi, struct child_info *child,
 
 		ftype = dentry[i].file_type;
 		if ((ftype <= F2FS_FT_UNKNOWN || ftype > F2FS_FT_LAST_FILE_TYPE)) {
-			ASSERT_MSG("Bad dentry 0x%x with unexpected ftype 0x%x", i, ftype);
+			ASSERT_MSG("Bad dentry 0x%x with unexpected ftype 0x%x", ino, ftype);
 			if (config.fix_on) {
 				FIX_MSG("Clear bad dentry 0x%x with bad ftype 0x%x",
 					i, ftype);
-				clear_bit(i, bitmap);
+				test_and_clear_bit_le(i, bitmap);
 				fixed = 1;
 			}
 			i++;
@@ -960,7 +1009,7 @@ static int __chk_dentries(struct f2fs_sb_info *sbi, struct child_info *child,
 			ASSERT_MSG("Bad dentry 0x%x with zero name_len", i);
 			if (config.fix_on) {
 				FIX_MSG("Clear bad dentry 0x%x", i);
-				clear_bit(i, bitmap);
+				test_and_clear_bit_le(i, bitmap);
 				fixed = 1;
 			}
 			i++;
@@ -996,13 +1045,13 @@ static int __chk_dentries(struct f2fs_sb_info *sbi, struct child_info *child,
 		blk_cnt = 1;
 		ret = fsck_chk_node_blk(sbi,
 				NULL, le32_to_cpu(dentry[i].ino), name,
-				ftype, TYPE_INODE, &blk_cnt, NULL);
+				ftype, TYPE_INODE, &blk_cnt, NULL, NULL);
 
 		if (ret && config.fix_on) {
 			int j;
 
 			for (j = 0; j < slots; j++)
-				clear_bit(i + j, bitmap);
+				test_and_clear_bit_le(i + j, bitmap);
 			FIX_MSG("Unlink [0x%x] - %s len[0x%x], type[0x%x]",
 					le32_to_cpu(dentry[i].ino),
 					name, name_len,
@@ -1033,7 +1082,7 @@ int fsck_chk_inline_dentries(struct f2fs_sb_info *sbi,
 
 	fsck->dentry_depth++;
 	dentries = __chk_dentries(sbi, child,
-			(unsigned long *)de_blk->dentry_bitmap,
+			de_blk->dentry_bitmap,
 			de_blk->dentry, de_blk->filename,
 			NR_INLINE_DENTRY, 1,
 			file_is_encrypt(node_blk->i.i_advise));
@@ -1065,11 +1114,11 @@ int fsck_chk_dentry_blk(struct f2fs_sb_info *sbi, u32 blk_addr,
 
 	fsck->dentry_depth++;
 	dentries = __chk_dentries(sbi, child,
-			(unsigned long *)de_blk->dentry_bitmap,
+			de_blk->dentry_bitmap,
 			de_blk->dentry, de_blk->filename,
 			NR_DENTRY_IN_BLOCK, last_blk, encrypted);
 
-	if (dentries < 0) {
+	if (dentries < 0 && !config.ro) {
 		ret = dev_write_block(de_blk, blk_addr);
 		ASSERT(ret >= 0);
 		DBG(1, "[%3d] Dentry Block [0x%x] Fixed hash_codes\n\n",
@@ -1134,14 +1183,13 @@ void fsck_chk_orphan_node(struct f2fs_sb_info *sbi)
 	u32 blk_cnt = 0;
 	block_t start_blk, orphan_blkaddr, i, j;
 	struct f2fs_orphan_block *orphan_blk, *new_blk;
-	struct f2fs_checkpoint *ckpt = F2FS_CKPT(sbi);
+	struct f2fs_super_block *sb = F2FS_RAW_SUPER(sbi);
 	u32 entry_count;
 
-	if (!is_set_ckpt_flags(ckpt, CP_ORPHAN_PRESENT_FLAG))
+	if (!is_set_ckpt_flags(F2FS_CKPT(sbi), CP_ORPHAN_PRESENT_FLAG))
 		return;
 
-	start_blk = __start_cp_addr(sbi) + 1 +
-		le32_to_cpu(F2FS_RAW_SUPER(sbi)->cp_payload);
+	start_blk = __start_cp_addr(sbi) + 1 + get_sb(cp_payload);
 	orphan_blkaddr = __start_sum_addr(sbi) - 1;
 
 	orphan_blk = calloc(BLOCK_SZ, 1);
@@ -1163,7 +1211,7 @@ void fsck_chk_orphan_node(struct f2fs_sb_info *sbi)
 			blk_cnt = 1;
 			ret = fsck_chk_node_blk(sbi, NULL, ino, NULL,
 					F2FS_FT_ORPHAN, TYPE_INODE, &blk_cnt,
-					NULL);
+					NULL, NULL);
 			if (!ret)
 				new_blk->ino[new_entry_count++] =
 							orphan_blk->ino[j];
@@ -1172,7 +1220,8 @@ void fsck_chk_orphan_node(struct f2fs_sb_info *sbi)
 			else if (ret)
 				ASSERT_MSG("[0x%x] wrong orphan inode", ino);
 		}
-		if (config.fix_on && entry_count != new_entry_count) {
+		if (!config.ro && config.fix_on &&
+				entry_count != new_entry_count) {
 			new_blk->entry_count = cpu_to_le32(new_entry_count);
 			ret = dev_write_block(new_blk, start_blk + i);
 			ASSERT(ret >= 0);
@@ -1207,6 +1256,7 @@ void fsck_init(struct f2fs_sb_info *sbi)
 
 	build_sit_area_bitmap(sbi);
 
+	ASSERT(tree_mark_size != 0);
 	tree_mark = calloc(tree_mark_size, 1);
 	ASSERT(tree_mark != NULL);
 }
@@ -1258,8 +1308,8 @@ static void fix_nat_entries(struct f2fs_sb_info *sbi)
 static void fix_checkpoint(struct f2fs_sb_info *sbi)
 {
 	struct f2fs_fsck *fsck = F2FS_FSCK(sbi);
-	struct f2fs_super_block *raw_sb = sbi->raw_super;
-	struct f2fs_checkpoint *ckp = F2FS_CKPT(sbi);
+	struct f2fs_super_block *sb = F2FS_RAW_SUPER(sbi);
+	struct f2fs_checkpoint *cp = F2FS_CKPT(sbi);
 	unsigned long long cp_blk_no;
 	u32 flags = CP_UMOUNT_FLAG;
 	block_t orphan_blks = 0;
@@ -1267,33 +1317,31 @@ static void fix_checkpoint(struct f2fs_sb_info *sbi)
 	int ret;
 	u_int32_t crc = 0;
 
-	if (is_set_ckpt_flags(ckp, CP_ORPHAN_PRESENT_FLAG)) {
+	if (is_set_ckpt_flags(cp, CP_ORPHAN_PRESENT_FLAG)) {
 		orphan_blks = __start_sum_addr(sbi) - 1;
 		flags |= CP_ORPHAN_PRESENT_FLAG;
 	}
 
-	ckp->ckpt_flags = cpu_to_le32(flags);
-	ckp->cp_pack_total_block_count =
-		cpu_to_le32(8 + orphan_blks + le32_to_cpu(raw_sb->cp_payload));
+	set_cp(ckpt_flags, flags);
+	set_cp(cp_pack_total_block_count, 8 + orphan_blks + get_sb(cp_payload));
 
-	ckp->free_segment_count = cpu_to_le32(fsck->chk.free_segs);
-	ckp->valid_block_count = cpu_to_le32(fsck->chk.valid_blk_cnt);
-	ckp->valid_node_count = cpu_to_le32(fsck->chk.valid_node_cnt);
-	ckp->valid_inode_count = cpu_to_le32(fsck->chk.valid_inode_cnt);
+	set_cp(free_segment_count, fsck->chk.free_segs);
+	set_cp(valid_block_count, fsck->chk.valid_blk_cnt);
+	set_cp(valid_node_count, fsck->chk.valid_node_cnt);
+	set_cp(valid_inode_count, fsck->chk.valid_inode_cnt);
 
-	crc = f2fs_cal_crc32(F2FS_SUPER_MAGIC, ckp, CHECKSUM_OFFSET);
-	*((__le32 *)((unsigned char *)ckp + CHECKSUM_OFFSET)) =
-							cpu_to_le32(crc);
+	crc = f2fs_cal_crc32(F2FS_SUPER_MAGIC, cp, CHECKSUM_OFFSET);
+	*((__le32 *)((unsigned char *)cp + CHECKSUM_OFFSET)) = cpu_to_le32(crc);
 
-	cp_blk_no = le32_to_cpu(raw_sb->cp_blkaddr);
+	cp_blk_no = get_sb(cp_blkaddr);
 	if (sbi->cur_cp == 2)
-		cp_blk_no += 1 << le32_to_cpu(raw_sb->log_blocks_per_seg);
+		cp_blk_no += 1 << get_sb(log_blocks_per_seg);
 
-	ret = dev_write_block(ckp, cp_blk_no++);
+	ret = dev_write_block(cp, cp_blk_no++);
 	ASSERT(ret >= 0);
 
-	for (i = 0; i < le32_to_cpu(raw_sb->cp_payload); i++) {
-		ret = dev_write_block(((unsigned char *)ckp) + i * F2FS_BLKSIZE,
+	for (i = 0; i < get_sb(cp_payload); i++) {
+		ret = dev_write_block(((unsigned char *)cp) + i * F2FS_BLKSIZE,
 								cp_blk_no++);
 		ASSERT(ret >= 0);
 	}
@@ -1307,7 +1355,7 @@ static void fix_checkpoint(struct f2fs_sb_info *sbi)
 		ASSERT(ret >= 0);
 	}
 
-	ret = dev_write_block(ckp, cp_blk_no++);
+	ret = dev_write_block(cp, cp_blk_no++);
 	ASSERT(ret >= 0);
 }
 
@@ -1318,12 +1366,23 @@ int check_curseg_offset(struct f2fs_sb_info *sbi)
 	for (i = 0; i < NO_CHECK_TYPE; i++) {
 		struct curseg_info *curseg = CURSEG_I(sbi, i);
 		struct seg_entry *se;
+		int j, nblocks;
 
 		se = get_seg_entry(sbi, curseg->segno);
 		if (f2fs_test_bit(curseg->next_blkoff,
-				(const char *)se->cur_valid_map) == 1) {
+					(const char *)se->cur_valid_map)) {
 			ASSERT_MSG("Next block offset is not free, type:%d", i);
 			return -EINVAL;
+		}
+		if (curseg->alloc_type == SSR)
+			return 0;
+
+		nblocks = sbi->blocks_per_seg;
+		for (j = curseg->next_blkoff + 1; j < nblocks; j++) {
+			if (f2fs_test_bit(j, (const char *)se->cur_valid_map)) {
+				ASSERT_MSG("LFS must have free section:%d", i);
+				return -EINVAL;
+			}
 		}
 	}
 	return 0;
@@ -1475,9 +1534,11 @@ int fsck_verify(struct f2fs_sb_info *sbi)
 	}
 
 	/* fix global metadata */
-	if (force || (config.bug_on && config.fix_on)) {
+	if (force || (config.bug_on && config.fix_on && !config.ro)) {
 		fix_hard_links(sbi);
 		fix_nat_entries(sbi);
+		move_curseg_info(sbi, SM_I(sbi)->main_blkaddr);
+		write_curseg_info(sbi);
 		rewrite_sit_area_bitmap(sbi);
 		fix_checkpoint(sbi);
 	}

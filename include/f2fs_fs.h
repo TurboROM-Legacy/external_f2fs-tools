@@ -220,6 +220,7 @@ static inline uint64_t bswap_64(uint64_t val)
 enum f2fs_config_func {
 	FSCK,
 	DUMP,
+	DEFRAG,
 };
 
 struct f2fs_configuration {
@@ -250,7 +251,14 @@ struct f2fs_configuration {
 	int fix_on;
 	int bug_on;
 	int auto_fix;
+	int ro;
 	__le32 feature;			/* defined features */
+
+	/* defragmentation parameters */
+	int defrag_shrink;
+	u_int64_t defrag_start;
+	u_int64_t defrag_len;
+	u_int64_t defrag_target;
 } __attribute__((packed));
 
 #ifdef CONFIG_64BIT
@@ -261,6 +269,79 @@ struct f2fs_configuration {
 
 #define BIT_MASK(nr)	(1 << (nr % BITS_PER_LONG))
 #define BIT_WORD(nr)	(nr / BITS_PER_LONG)
+
+#define set_sb_le64(member, val)		(sb->member = cpu_to_le64(val))
+#define set_sb_le32(member, val)		(sb->member = cpu_to_le32(val))
+#define set_sb_le16(member, val)		(sb->member = cpu_to_le16(val))
+#define get_sb_le64(member)			le64_to_cpu(sb->member)
+#define get_sb_le32(member)			le32_to_cpu(sb->member)
+#define get_sb_le16(member)			le16_to_cpu(sb->member)
+
+#define set_sb(member, val)	\
+			do {						\
+				typeof(sb->member) t;			\
+				switch (sizeof(t)) {			\
+				case 8: set_sb_le64(member, val); break; \
+				case 4: set_sb_le32(member, val); break; \
+				case 2: set_sb_le16(member, val); break; \
+				} \
+			} while(0)
+
+#define get_sb(member)		\
+			({						\
+				typeof(sb->member) t;			\
+				switch (sizeof(t)) {			\
+				case 8: t = get_sb_le64(member); break; \
+				case 4: t = get_sb_le32(member); break; \
+				case 2: t = get_sb_le16(member); break; \
+				} 					\
+				t; \
+			})
+
+#define set_cp_le64(member, val)		(cp->member = cpu_to_le64(val))
+#define set_cp_le32(member, val)		(cp->member = cpu_to_le32(val))
+#define set_cp_le16(member, val)		(cp->member = cpu_to_le16(val))
+#define get_cp_le64(member)			le64_to_cpu(cp->member)
+#define get_cp_le32(member)			le32_to_cpu(cp->member)
+#define get_cp_le16(member)			le16_to_cpu(cp->member)
+
+#define set_cp(member, val)	\
+			do {						\
+				typeof(cp->member) t;			\
+				switch (sizeof(t)) {			\
+				case 8: set_cp_le64(member, val); break; \
+				case 4: set_cp_le32(member, val); break; \
+				case 2: set_cp_le16(member, val); break; \
+				} \
+			} while(0)
+
+#define get_cp(member)		\
+			({						\
+				typeof(cp->member) t;			\
+				switch (sizeof(t)) {			\
+				case 8: t = get_cp_le64(member); break; \
+				case 4: t = get_cp_le32(member); break; \
+				case 2: t = get_cp_le16(member); break; \
+				} 					\
+				t; \
+			})
+
+/*
+ * Copied from include/linux/kernel.h
+ */
+#define __round_mask(x, y)	((__typeof__(x))((y)-1))
+#define round_down(x, y)	((x) & ~__round_mask(x, y))
+#define min(x, y) ({				\
+	typeof(x) _min1 = (x);			\
+	typeof(y) _min2 = (y);			\
+	(void) (&_min1 == &_min2);		\
+	_min1 < _min2 ? _min1 : _min2; })
+
+#define max(x, y) ({				\
+	typeof(x) _max1 = (x);			\
+	typeof(y) _max2 = (y);			\
+	(void) (&_max1 == &_max2);		\
+	_max1 > _max2 ? _max1 : _max2; })
 
 /*
  * Copied from fs/f2fs/f2fs.h
@@ -317,6 +398,8 @@ enum {
 
 #define F2FS_FEATURE_ENCRYPT	0x0001
 
+#define MAX_VOLUME_NAME		512
+
 /*
  * For superblock
  */
@@ -349,7 +432,7 @@ struct f2fs_super_block {
 	__le32 node_ino;		/* node inode number */
 	__le32 meta_ino;		/* meta inode number */
 	__u8 uuid[16];			/* 128-bit uuid for volume */
-	__le16 volume_name[512];	/* volume name */
+	__le16 volume_name[MAX_VOLUME_NAME];	/* volume name */
 	__le32 extension_count;		/* # of extensions below */
 	__u8 extension_list[F2FS_MAX_EXTENSION][8];	/* extension array */
 	__le32 cp_payload;
@@ -766,19 +849,20 @@ enum {
 	SSR
 };
 
-extern void ASCIIToUNICODE(u_int16_t *, u_int8_t *);
+extern int utf8_to_utf16(u_int16_t *, const char *, size_t, size_t);
+extern int utf16_to_utf8(char *, const u_int16_t *, size_t, size_t);
 extern int log_base_2(u_int32_t);
 extern unsigned int addrs_per_inode(struct f2fs_inode *);
 
 extern int get_bits_in_byte(unsigned char n);
-extern int set_bit(unsigned int nr,void * addr);
-extern int clear_bit(unsigned int nr, void * addr);
-extern int test_bit(unsigned int nr, const void * addr);
+extern int test_and_set_bit_le(u32, u8 *);
+extern int test_and_clear_bit_le(u32, u8 *);
+extern int test_bit_le(u32, const u8 *);
 extern int f2fs_test_bit(unsigned int, const char *);
 extern int f2fs_set_bit(unsigned int, char *);
 extern int f2fs_clear_bit(unsigned int, char *);
-extern unsigned long find_next_bit(const unsigned long *,
-				unsigned long, unsigned long);
+extern u64 find_next_bit_le(const u8 *, u64, u64);
+extern u64 find_next_zero_bit_le(const u8 *, u64, u64);
 
 extern u_int32_t f2fs_cal_crc32(u_int32_t, void *, int);
 extern int f2fs_crc_valid(u_int32_t blk_crc, void *buf, int len);
@@ -809,5 +893,33 @@ extern struct f2fs_configuration config;
 #define SEG_ALIGN(blks)		ALIGN(blks, config.blks_per_seg)
 #define ZONE_ALIGN(blks)	ALIGN(blks, config.blks_per_seg * \
 					config.segs_per_zone)
+
+static inline double get_best_overprovision(struct f2fs_super_block *sb)
+{
+	double reserved, ovp, candidate, end, diff, space;
+	double max_ovp = 0, max_space = 0;
+
+	if (get_sb(segment_count_main) < 256) {
+		candidate = 10;
+		end = 95;
+		diff = 5;
+	} else {
+		candidate = 0.01;
+		end = 10;
+		diff = 0.01;
+	}
+
+	for (; candidate <= end; candidate += diff) {
+		reserved = (2 * (100 / candidate + 1) + 6) *
+						get_sb(segs_per_sec);
+		ovp = (get_sb(segment_count_main) - reserved) * candidate / 100;
+		space = get_sb(segment_count_main) - reserved - ovp;
+		if (max_space < space) {
+			max_space = space;
+			max_ovp = candidate;
+		}
+	}
+	return max_ovp;
+}
 
 #endif	/*__F2FS_FS_H */

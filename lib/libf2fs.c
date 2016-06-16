@@ -23,18 +23,177 @@
 
 #include <f2fs_fs.h>
 
-void ASCIIToUNICODE(u_int16_t *out_buf, u_int8_t *in_buf)
+/*
+ * UTF conversion codes are Copied from exfat tools.
+ */
+static const char *utf8_to_wchar(const char *input, wchar_t *wc,
+		size_t insize)
 {
-	u_int8_t *pchTempPtr = in_buf;
-	u_int16_t *pwTempPtr = out_buf;
-
-	while (*pchTempPtr != '\0') {
-		*pwTempPtr = (u_int16_t)*pchTempPtr;
-		pchTempPtr++;
-		pwTempPtr++;
+	if ((input[0] & 0x80) == 0 && insize >= 1) {
+		*wc = (wchar_t) input[0];
+		return input + 1;
 	}
-	*pwTempPtr = '\0';
-	return;
+	if ((input[0] & 0xe0) == 0xc0 && insize >= 2) {
+		*wc = (((wchar_t) input[0] & 0x1f) << 6) |
+		       ((wchar_t) input[1] & 0x3f);
+		return input + 2;
+	}
+	if ((input[0] & 0xf0) == 0xe0 && insize >= 3) {
+		*wc = (((wchar_t) input[0] & 0x0f) << 12) |
+		      (((wchar_t) input[1] & 0x3f) << 6) |
+		       ((wchar_t) input[2] & 0x3f);
+		return input + 3;
+	}
+	if ((input[0] & 0xf8) == 0xf0 && insize >= 4) {
+		*wc = (((wchar_t) input[0] & 0x07) << 18) |
+		      (((wchar_t) input[1] & 0x3f) << 12) |
+		      (((wchar_t) input[2] & 0x3f) << 6) |
+		       ((wchar_t) input[3] & 0x3f);
+		return input + 4;
+	}
+	if ((input[0] & 0xfc) == 0xf8 && insize >= 5) {
+		*wc = (((wchar_t) input[0] & 0x03) << 24) |
+		      (((wchar_t) input[1] & 0x3f) << 18) |
+		      (((wchar_t) input[2] & 0x3f) << 12) |
+		      (((wchar_t) input[3] & 0x3f) << 6) |
+		       ((wchar_t) input[4] & 0x3f);
+		return input + 5;
+	}
+	if ((input[0] & 0xfe) == 0xfc && insize >= 6) {
+		*wc = (((wchar_t) input[0] & 0x01) << 30) |
+		      (((wchar_t) input[1] & 0x3f) << 24) |
+		      (((wchar_t) input[2] & 0x3f) << 18) |
+		      (((wchar_t) input[3] & 0x3f) << 12) |
+		      (((wchar_t) input[4] & 0x3f) << 6) |
+		       ((wchar_t) input[5] & 0x3f);
+		return input + 6;
+	}
+	return NULL;
+}
+
+static u_int16_t *wchar_to_utf16(u_int16_t *output, wchar_t wc, size_t outsize)
+{
+	if (wc <= 0xffff) {
+		if (outsize == 0)
+			return NULL;
+		output[0] = cpu_to_le16(wc);
+		return output + 1;
+	}
+	if (outsize < 2)
+		return NULL;
+	wc -= 0x10000;
+	output[0] = cpu_to_le16(0xd800 | ((wc >> 10) & 0x3ff));
+	output[1] = cpu_to_le16(0xdc00 | (wc & 0x3ff));
+	return output + 2;
+}
+
+int utf8_to_utf16(u_int16_t *output, const char *input, size_t outsize,
+		size_t insize)
+{
+	const char *inp = input;
+	u_int16_t *outp = output;
+	wchar_t wc;
+
+	while (inp - input < insize && *inp) {
+		inp = utf8_to_wchar(inp, &wc, insize - (inp - input));
+		if (inp == NULL) {
+			DBG(0, "illegal UTF-8 sequence\n");
+			return -EILSEQ;
+		}
+		outp = wchar_to_utf16(outp, wc, outsize - (outp - output));
+		if (outp == NULL) {
+			DBG(0, "name is too long\n");
+			return -ENAMETOOLONG;
+		}
+	}
+	*outp = cpu_to_le16(0);
+	return 0;
+}
+
+static const u_int16_t *utf16_to_wchar(const u_int16_t *input, wchar_t *wc,
+		size_t insize)
+{
+	if ((le16_to_cpu(input[0]) & 0xfc00) == 0xd800) {
+		if (insize < 2 || (le16_to_cpu(input[1]) & 0xfc00) != 0xdc00)
+			return NULL;
+		*wc = ((wchar_t) (le16_to_cpu(input[0]) & 0x3ff) << 10);
+		*wc |= (le16_to_cpu(input[1]) & 0x3ff);
+		*wc += 0x10000;
+		return input + 2;
+	} else {
+		*wc = le16_to_cpu(*input);
+		return input + 1;
+	}
+}
+
+static char *wchar_to_utf8(char *output, wchar_t wc, size_t outsize)
+{
+	if (wc <= 0x7f) {
+		if (outsize < 1)
+			return NULL;
+		*output++ = (char) wc;
+	} else if (wc <= 0x7ff) {
+		if (outsize < 2)
+			return NULL;
+		*output++ = 0xc0 | (wc >> 6);
+		*output++ = 0x80 | (wc & 0x3f);
+	} else if (wc <= 0xffff) {
+		if (outsize < 3)
+			return NULL;
+		*output++ = 0xe0 | (wc >> 12);
+		*output++ = 0x80 | ((wc >> 6) & 0x3f);
+		*output++ = 0x80 | (wc & 0x3f);
+	} else if (wc <= 0x1fffff) {
+		if (outsize < 4)
+			return NULL;
+		*output++ = 0xf0 | (wc >> 18);
+		*output++ = 0x80 | ((wc >> 12) & 0x3f);
+		*output++ = 0x80 | ((wc >> 6) & 0x3f);
+		*output++ = 0x80 | (wc & 0x3f);
+	} else if (wc <= 0x3ffffff) {
+		if (outsize < 5)
+			return NULL;
+		*output++ = 0xf8 | (wc >> 24);
+		*output++ = 0x80 | ((wc >> 18) & 0x3f);
+		*output++ = 0x80 | ((wc >> 12) & 0x3f);
+		*output++ = 0x80 | ((wc >> 6) & 0x3f);
+		*output++ = 0x80 | (wc & 0x3f);
+	} else if (wc <= 0x7fffffff) {
+		if (outsize < 6)
+			return NULL;
+		*output++ = 0xfc | (wc >> 30);
+		*output++ = 0x80 | ((wc >> 24) & 0x3f);
+		*output++ = 0x80 | ((wc >> 18) & 0x3f);
+		*output++ = 0x80 | ((wc >> 12) & 0x3f);
+		*output++ = 0x80 | ((wc >> 6) & 0x3f);
+		*output++ = 0x80 | (wc & 0x3f);
+	} else
+		return NULL;
+
+	return output;
+}
+
+int utf16_to_utf8(char *output, const u_int16_t *input, size_t outsize,
+		size_t insize)
+{
+	const u_int16_t *inp = input;
+	char *outp = output;
+	wchar_t wc;
+
+	while (inp - input < insize && le16_to_cpu(*inp)) {
+		inp = utf16_to_wchar(inp, &wc, insize - (inp - input));
+		if (inp == NULL) {
+			DBG(0, "illegal UTF-16 sequence\n");
+			return -EILSEQ;
+		}
+		outp = wchar_to_utf8(outp, wc, outsize - (outp - output));
+		if (outp == NULL) {
+			DBG(0, "name is too long\n");
+			return -ENAMETOOLONG;
+		}
+	}
+	*outp = '\0';
+	return 0;
 }
 
 int log_base_2(u_int32_t num)
@@ -75,37 +234,31 @@ int get_bits_in_byte(unsigned char n)
 	return bits_in_byte[n];
 }
 
-int set_bit(unsigned int nr,void * addr)
+int test_and_set_bit_le(u32 nr, u8 *addr)
 {
-	int             mask, retval;
-	unsigned char   *ADDR = (unsigned char *) addr;
+	int mask, retval;
 
-	ADDR += nr >> 3;
+	addr += nr >> 3;
 	mask = 1 << ((nr & 0x07));
-	retval = mask & *ADDR;
-	*ADDR |= mask;
+	retval = mask & *addr;
+	*addr |= mask;
 	return retval;
 }
 
-int clear_bit(unsigned int nr, void * addr)
+int test_and_clear_bit_le(u32 nr, u8 *addr)
 {
-	int             mask, retval;
-	unsigned char   *ADDR = (unsigned char *) addr;
+	int mask, retval;
 
-	ADDR += nr >> 3;
+	addr += nr >> 3;
 	mask = 1 << ((nr & 0x07));
-	retval = mask & *ADDR;
-	*ADDR &= ~mask;
+	retval = mask & *addr;
+	*addr &= ~mask;
 	return retval;
 }
 
-int test_bit(unsigned int nr, const void * addr)
+int test_bit_le(u32 nr, const u8 *addr)
 {
-	const __u32 *p = (const __u32 *)addr;
-
-	nr = nr ^ 0;
-
-	return ((1 << (nr & 31)) & (p[nr >> 5])) != 0;
+	return ((1 << (nr & 7)) & (addr[nr >> 3]));
 }
 
 int f2fs_test_bit(unsigned int nr, const char *p)
@@ -142,24 +295,10 @@ int f2fs_clear_bit(unsigned int nr, char *addr)
 	return ret;
 }
 
-static inline unsigned long __ffs(unsigned long word)
+static inline u64 __ffs(u8 word)
 {
 	int num = 0;
 
-#if BITS_PER_LONG == 64
-	if ((word & 0xffffffff) == 0) {
-		num += 32;
-		word >>= 32;
-	}
-#endif
-	if ((word & 0xffff) == 0) {
-		num += 16;
-		word >>= 16;
-	}
-	if ((word & 0xff) == 0) {
-		num += 8;
-		word >>= 8;
-	}
 	if ((word & 0xf) == 0) {
 		num += 4;
 		word >>= 4;
@@ -173,43 +312,42 @@ static inline unsigned long __ffs(unsigned long word)
 	return num;
 }
 
-unsigned long find_next_bit(const unsigned long *addr, unsigned long size,
-                unsigned long offset)
+/* Copied from linux/lib/find_bit.c */
+#define BITMAP_FIRST_BYTE_MASK(start) (0xff << ((start) & (BITS_PER_BYTE - 1)))
+
+static u64 _find_next_bit_le(const u8 *addr, u64 nbits, u64 start, char invert)
 {
-        const unsigned long *p = addr + BIT_WORD(offset);
-        unsigned long result = offset & ~(BITS_PER_LONG-1);
-        unsigned long tmp;
+	u8 tmp;
 
-        if (offset >= size)
-                return size;
-        size -= result;
-        offset %= BITS_PER_LONG;
-        if (offset) {
-                tmp = *(p++);
-                tmp &= (~0UL << offset);
-                if (size < BITS_PER_LONG)
-                        goto found_first;
-                if (tmp)
-                        goto found_middle;
-                size -= BITS_PER_LONG;
-                result += BITS_PER_LONG;
-        }
-        while (size & ~(BITS_PER_LONG-1)) {
-                if ((tmp = *(p++)))
-                        goto found_middle;
-                result += BITS_PER_LONG;
-                size -= BITS_PER_LONG;
-        }
-        if (!size)
-                return result;
-        tmp = *p;
+	if (!nbits || start >= nbits)
+		return nbits;
 
-found_first:
-        tmp &= (~0UL >> (BITS_PER_LONG - size));
-        if (tmp == 0UL)		/* Are any bits set? */
-                return result + size;   /* Nope. */
-found_middle:
-        return result + __ffs(tmp);
+	tmp = addr[start / BITS_PER_BYTE] ^ invert;
+
+	/* Handle 1st word. */
+	tmp &= BITMAP_FIRST_BYTE_MASK(start);
+	start = round_down(start, BITS_PER_BYTE);
+
+	while (!tmp) {
+		start += BITS_PER_BYTE;
+		if (start >= nbits)
+			return nbits;
+
+		tmp = addr[start / BITS_PER_BYTE] ^ invert;
+	}
+
+	return min(start + __ffs(tmp), nbits);
+}
+
+u64 find_next_bit_le(const u8 *addr, u64 size, u64 offset)
+{
+	return _find_next_bit_le(addr, size, offset, 0);
+}
+
+
+u64 find_next_zero_bit_le(const u8 *addr, u64 size, u64 offset)
+{
+	return _find_next_bit_le(addr, size, offset, 0xff);
 }
 
 /*
@@ -362,9 +500,11 @@ void f2fs_init_configuration(struct f2fs_configuration *c)
 	c->vol_label = "";
 	c->device_name = NULL;
 	c->trim = 1;
+	c->ro = 0;
 }
 
-static int is_mounted(const char *mpt, const char *device)
+static int is_mounted(struct f2fs_configuration *c,
+				const char *mpt, const char *device)
 {
 	FILE *file = NULL;
 	struct mntent *mnt = NULL;
@@ -374,8 +514,11 @@ static int is_mounted(const char *mpt, const char *device)
 		return 0;
 
 	while ((mnt = getmntent(file)) != NULL) {
-		if (!strcmp(device, mnt->mnt_fsname))
+		if (!strcmp(device, mnt->mnt_fsname)) {
+			if (hasmntopt(mnt, MNTOPT_RO))
+				config.ro = 1;
 			break;
+		}
 	}
 	endmntent(file);
 	return mnt ? 1 : 0;
@@ -386,9 +529,9 @@ int f2fs_dev_is_umounted(struct f2fs_configuration *c)
 	struct stat st_buf;
 	int ret = 0;
 
-	ret = is_mounted(MOUNTED, c->device_name);
+	ret = is_mounted(c, MOUNTED, c->device_name);
 	if (ret) {
-		MSG(0, "\tError: Not available on mounted device!\n");
+		MSG(0, "Info: Mounted device!\n");
 		return -1;
 	}
 
@@ -396,9 +539,9 @@ int f2fs_dev_is_umounted(struct f2fs_configuration *c)
 	 * if failed due to /etc/mtab file not present
 	 * try with /proc/mounts.
 	 */
-	ret = is_mounted("/proc/mounts", c->device_name);
+	ret = is_mounted(c, "/proc/mounts", c->device_name);
 	if (ret) {
-		MSG(0, "\tError: Not available on mounted device!\n");
+		MSG(0, "Info: Mounted device!\n");
 		return -1;
 	}
 
@@ -498,7 +641,8 @@ int f2fs_get_device_info(struct f2fs_configuration *c)
 	}
 	MSG(0, "Info: sector size = %u\n", c->sector_size);
 	MSG(0, "Info: total sectors = %"PRIu64" (%"PRIu64" MB)\n",
-				c->total_sectors, c->total_sectors >> 11);
+				c->total_sectors, (c->total_sectors *
+					(c->sector_size >> 9)) >> 11);
 	return 0;
 }
 

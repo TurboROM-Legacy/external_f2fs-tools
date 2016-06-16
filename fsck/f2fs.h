@@ -74,6 +74,7 @@ struct seg_entry {
 	unsigned char type;             /* segment type like CURSEG_XXX_TYPE */
 	unsigned char orig_type;        /* segment type like CURSEG_XXX_TYPE */
 	unsigned long long mtime;       /* modification time of the segment */
+	int dirty;
 };
 
 struct sec_entry {
@@ -294,7 +295,7 @@ static inline block_t __end_block_addr(struct f2fs_sb_info *sbi)
 #define GET_R2L_SEGNO(sbi, segno)	(segno + FREE_I_START_SEGNO(sbi))
 
 #define START_BLOCK(sbi, segno)	(SM_I(sbi)->main_blkaddr +		\
-	(segno << sbi->log_blocks_per_seg))
+	((segno) << sbi->log_blocks_per_seg))
 
 static inline struct curseg_info *CURSEG_I(struct f2fs_sb_info *sbi, int type)
 {
@@ -352,6 +353,22 @@ static inline bool IS_VALID_BLK_ADDR(struct f2fs_sb_info *sbi, u32 addr)
 			return 0;
 	}
 	return 1;
+}
+
+static inline int IS_CUR_SEGNO(struct f2fs_sb_info *sbi, u32 segno, int type)
+{
+	int i;
+
+	for (i = 0; i < NO_CHECK_TYPE; i++) {
+		struct curseg_info *curseg = CURSEG_I(sbi, i);
+
+		if (type == i)
+			continue;
+
+		if (segno == curseg->segno)
+			return 1;
+	}
+	return 0;
 }
 
 static inline u64 BLKOFF_FROM_MAIN(struct f2fs_sb_info *sbi, u64 blk_addr)

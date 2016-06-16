@@ -22,7 +22,8 @@
 #include "f2fs_format_utils.h"
 
 extern struct f2fs_configuration config;
-struct f2fs_super_block sb;
+struct f2fs_super_block raw_sb;
+struct f2fs_super_block *sb = &raw_sb;
 struct f2fs_checkpoint *cp;
 
 /* Return first segment number of each area */
@@ -30,63 +31,6 @@ struct f2fs_checkpoint *cp;
 #define next_zone(cur)		(config.cur_seg[cur] + config.segs_per_zone)
 #define last_zone(cur)		((cur - 1) * config.segs_per_zone)
 #define last_section(cur)	(cur + (config.secs_per_zone - 1) * config.segs_per_sec)
-
-#define set_sb_le64(member, val)		(sb.member = cpu_to_le64(val))
-#define set_sb_le32(member, val)		(sb.member = cpu_to_le32(val))
-#define set_sb_le16(member, val)		(sb.member = cpu_to_le16(val))
-#define get_sb_le64(member)			le64_to_cpu(sb.member)
-#define get_sb_le32(member)			le32_to_cpu(sb.member)
-#define get_sb_le16(member)			le16_to_cpu(sb.member)
-
-#define set_sb(member, val)	\
-			do {						\
-				typeof(sb.member) t;			\
-				switch (sizeof(t)) {			\
-				case 8: set_sb_le64(member, val); break; \
-				case 4: set_sb_le32(member, val); break; \
-				case 2: set_sb_le16(member, val); break; \
-				} \
-			} while(0)
-
-#define get_sb(member)		\
-			({						\
-				typeof(sb.member) t;			\
-				switch (sizeof(t)) {			\
-				case 8: t = get_sb_le64(member); break; \
-				case 4: t = get_sb_le32(member); break; \
-				case 2: t = get_sb_le16(member); break; \
-				} 					\
-				t; \
-			})
-
-#define set_cp_le64(member, val)		(cp->member = cpu_to_le64(val))
-#define set_cp_le32(member, val)		(cp->member = cpu_to_le32(val))
-#define set_cp_le16(member, val)		(cp->member = cpu_to_le16(val))
-#define get_cp_le64(member)			le64_to_cpu(cp->member)
-#define get_cp_le32(member)			le32_to_cpu(cp->member)
-#define get_cp_le16(member)			le16_to_cpu(cp->member)
-
-#define set_cp(member, val)	\
-			do {						\
-				typeof(cp->member) t;			\
-				switch (sizeof(t)) {			\
-				case 8: set_cp_le64(member, val); break; \
-				case 4: set_cp_le32(member, val); break; \
-				case 2: set_cp_le16(member, val); break; \
-				} \
-			} while(0)
-
-#define get_cp(member)		\
-			({						\
-				typeof(cp->member) t;			\
-				switch (sizeof(t)) {			\
-				case 8: t = get_cp_le64(member); break; \
-				case 4: t = get_cp_le32(member); break; \
-				case 2: t = get_cp_le16(member); break; \
-				} 					\
-				t; \
-			})
-
 
 const char *media_ext_lists[] = {
 	"jpg",
@@ -118,6 +62,19 @@ const char *media_ext_lists[] = {
 	NULL
 };
 
+static bool is_extension_exist(const char *name)
+{
+	int i;
+
+	for (i = 0; i < F2FS_MAX_EXTENSION; i++) {
+		char *ext = (char *)sb->extension_list[i];
+		if (!strcmp(ext, name))
+			return 1;
+	}
+
+	return 0;
+}
+
 static void configure_extension_list(void)
 {
 	const char **extlist = media_ext_lists;
@@ -126,13 +83,12 @@ static void configure_extension_list(void)
 	int name_len;
 	int i = 0;
 
-	sb.extension_count = 0;
-	memset(sb.extension_list, 0,
-			sizeof(sb.extension_list));
+	set_sb(extension_count, 0);
+	memset(sb->extension_list, 0, sizeof(sb->extension_list));
 
 	while (*extlist) {
 		name_len = strlen(*extlist);
-		memcpy(sb.extension_list[i++], *extlist, name_len);
+		memcpy(sb->extension_list[i++], *extlist, name_len);
 		extlist++;
 	}
 	set_sb(extension_count, i);
@@ -141,11 +97,17 @@ static void configure_extension_list(void)
 		return;
 
 	/* add user ext list */
-	ue = strtok(ext_str, ",");
+	ue = strtok(ext_str, ", ");
 	while (ue != NULL) {
 		name_len = strlen(ue);
-		memcpy(sb.extension_list[i++], ue, name_len);
-		ue = strtok(NULL, ",");
+		if (name_len >= 8) {
+			MSG(0, "\tWarn: Extension name (%s) is too long\n", ue);
+			goto next;
+		}
+		if (!is_extension_exist(ue))
+			memcpy(sb->extension_list[i++], ue, name_len);
+next:
+		ue = strtok(NULL, ", ");
 		if (i >= F2FS_MAX_EXTENSION)
 			break;
 	}
@@ -153,34 +115,6 @@ static void configure_extension_list(void)
 	set_sb(extension_count, i);
 
 	free(config.extension_list);
-}
-
-static double get_best_overprovision(void)
-{
-	double reserved, ovp, candidate, end, diff, space;
-	double max_ovp = 0, max_space = 0;
-
-	if (get_sb(segment_count_main) < 256) {
-		candidate = 10;
-		end = 95;
-		diff = 5;
-	} else {
-		candidate = 0.01;
-		end = 10;
-		diff = 0.01;
-	}
-
-	for (; candidate <= end; candidate += diff) {
-		reserved = (2 * (100 / candidate + 1) + 6) *
-						get_sb(segs_per_sec);
-		ovp = (get_sb(segment_count_main) - reserved) * candidate / 100;
-		space = get_sb(segment_count_main) - reserved - ovp;
-		if (max_space < space) {
-			max_space = space;
-			max_ovp = candidate;
-		}
-	}
-	return max_ovp;
 }
 
 static int f2fs_prepare_super_block(void)
@@ -221,7 +155,7 @@ static int f2fs_prepare_super_block(void)
 		blk_size_bytes * config.secs_per_zone *
 		config.segs_per_sec * config.blks_per_seg;
 
-	sb.checksum_offset = 0;
+	set_sb(checksum_offset, 0);
 
 	set_sb(block_count, config.total_sectors >> log_sectors_per_block);
 
@@ -243,7 +177,7 @@ static int f2fs_prepare_super_block(void)
 				zone_align_start_offset) / segment_size_bytes);
 
 	set_sb(segment0_blkaddr, zone_align_start_offset / blk_size_bytes);
-	sb.cp_blkaddr = sb.segment0_blkaddr;
+	sb->cp_blkaddr = sb->segment0_blkaddr;
 
 	MSG(0, "Info: zone aligned segment0 blkaddr: %u\n", get_sb(segment0_blkaddr));
 
@@ -286,13 +220,13 @@ static int f2fs_prepare_super_block(void)
 	 * When sit is too large, we should expand cp area. It requires more pages for cp.
 	 */
 	if (max_sit_bitmap_size >
-			(CHECKSUM_OFFSET - sizeof(struct f2fs_checkpoint) + 65)) {
+			(CHECKSUM_OFFSET - sizeof(struct f2fs_checkpoint) + 1 - 64)) {
 		max_nat_bitmap_size = CHECKSUM_OFFSET - sizeof(struct f2fs_checkpoint) + 1;
 		set_sb(cp_payload, F2FS_BLK_ALIGN(max_sit_bitmap_size));
 	} else {
 		max_nat_bitmap_size = CHECKSUM_OFFSET - sizeof(struct f2fs_checkpoint) + 1
 			- max_sit_bitmap_size;
-		sb.cp_payload = 0;
+		set_sb(cp_payload, 0);
 	}
 
 	max_nat_segments = (max_nat_bitmap_size * 8) >> log_blks_per_seg;
@@ -340,7 +274,7 @@ static int f2fs_prepare_super_block(void)
 
 	/* Let's determine the best reserved and overprovisioned space */
 	if (config.overprovision == 0)
-		config.overprovision = get_best_overprovision();
+		config.overprovision = get_best_overprovision(sb);
 
 	config.reserved_segments =
 			(2 * (100 / config.overprovision + 1) + 6)
@@ -355,10 +289,10 @@ static int f2fs_prepare_super_block(void)
 		return -1;
 	}
 
-	uuid_generate(sb.uuid);
+	uuid_generate(sb->uuid);
 
-	ASCIIToUNICODE(sb.volume_name, (u_int8_t *)config.vol_label);
-
+	utf8_to_utf16(sb->volume_name, (const char *)config.vol_label,
+				MAX_VOLUME_NAME, strlen(config.vol_label));
 	set_sb(node_ino, 1);
 	set_sb(meta_ino, 2);
 	set_sb(root_ino, 3);
@@ -397,10 +331,10 @@ static int f2fs_prepare_super_block(void)
 		memset(config.version, 0, VERSION_LEN);
 	}
 
-	memcpy(sb.version, config.version, VERSION_LEN);
-	memcpy(sb.init_version, config.version, VERSION_LEN);
+	memcpy(sb->version, config.version, VERSION_LEN);
+	memcpy(sb->init_version, config.version, VERSION_LEN);
 
-	sb.feature = config.feature;
+	sb->feature = config.feature;
 
 	return 0;
 }
@@ -498,7 +432,7 @@ static int f2fs_write_check_point_pack(void)
 	}
 
 	sum_compact = calloc(F2FS_BLKSIZE, 1);
-	if (sum == NULL) {
+	if (sum_compact == NULL) {
 		MSG(1, "\tError: Calloc Failed for summay buffer!!!\n");
 		goto free_sum;
 	}
@@ -599,9 +533,9 @@ static int f2fs_write_check_point_pack(void)
 	SET_SUM_TYPE((&sum->footer), SUM_TYPE_DATA);
 
 	sum->n_nats = cpu_to_le16(1);
-	sum->nat_j.entries[0].nid = sb.root_ino;
+	sum->nat_j.entries[0].nid = sb->root_ino;
 	sum->nat_j.entries[0].ne.version = 0;
-	sum->nat_j.entries[0].ne.ino = sb.root_ino;
+	sum->nat_j.entries[0].ne.ino = sb->root_ino;
 	sum->nat_j.entries[0].ne.block_addr = cpu_to_le32(
 			get_sb(main_blkaddr) +
 			get_cp(cur_node_segno[0]) * config.blks_per_seg);
@@ -634,7 +568,7 @@ static int f2fs_write_check_point_pack(void)
 
 	/* hot data summary */
 	sum_entry = (struct f2fs_summary *)sum_compact_p;
-	sum_entry->nid = sb.root_ino;
+	sum_entry->nid = sb->root_ino;
 	sum_entry->ofs_in_node = 0;
 	/* warm data summary, nothing to do */
 	/* cold data summary, nothing to do */
@@ -651,7 +585,7 @@ static int f2fs_write_check_point_pack(void)
 	memset(sum, 0, sizeof(struct f2fs_summary_block));
 	SET_SUM_TYPE((&sum->footer), SUM_TYPE_NODE);
 
-	sum->entries[0].nid = sb.root_ino;
+	sum->entries[0].nid = sb->root_ino;
 	sum->entries[0].ofs_in_node = 0;
 
 	cp_seg_blk_offset += blk_size_bytes;
@@ -748,8 +682,7 @@ static int f2fs_write_super_block(void)
 
 	zero_buff = calloc(F2FS_BLKSIZE, 1);
 
-	memcpy(zero_buff + F2FS_SUPER_OFFSET, &sb,
-						sizeof(sb));
+	memcpy(zero_buff + F2FS_SUPER_OFFSET, sb, sizeof(*sb));
 	DBG(1, "\tWriting super block, at offset 0x%08x\n", 0);
 	for (index = 0; index < 2; index++) {
 		if (dev_write(zero_buff, index * F2FS_BLKSIZE, F2FS_BLKSIZE)) {
@@ -761,6 +694,32 @@ static int f2fs_write_super_block(void)
 	}
 
 	free(zero_buff);
+	return 0;
+}
+
+static int discard_obsolete_dnode(struct f2fs_node *raw_node, u_int64_t offset)
+{
+	do {
+		if (offset < get_sb(main_blkaddr) ||
+			offset >= get_sb(main_blkaddr) + get_sb(block_count))
+			break;
+
+		if (dev_read_block(raw_node, offset)) {
+			MSG(1, "\tError: While traversing direct node!!!\n");
+			return -1;
+		}
+
+		if (le64_to_cpu(raw_node->footer.cp_ver) == 1)
+			raw_node->footer.cp_ver = 0;
+
+		DBG(1, "\tDiscard dnode, at offset 0x%08"PRIx64"\n", offset);
+		if (dev_write_block(raw_node, offset)) {
+			MSG(1, "\tError: While discarding direct node!!!\n");
+			return -1;
+		}
+		offset = le32_to_cpu(raw_node->footer.next_blkaddr);
+	} while (1);
+
 	return 0;
 }
 
@@ -776,8 +735,8 @@ static int f2fs_write_root_inode(void)
 		return -1;
 	}
 
-	raw_node->footer.nid = sb.root_ino;
-	raw_node->footer.ino = sb.root_ino;
+	raw_node->footer.nid = sb->root_ino;
+	raw_node->footer.ino = sb->root_ino;
 	raw_node->footer.cp_ver = cpu_to_le64(1);
 	raw_node->footer.next_blkaddr = cpu_to_le32(
 			get_sb(main_blkaddr) +
@@ -810,8 +769,8 @@ static int f2fs_write_root_inode(void)
 	raw_node->i.i_addr[0] = cpu_to_le32(data_blk_nor);
 
 	raw_node->i.i_ext.fofs = 0;
-	raw_node->i.i_ext.blk_addr = cpu_to_le32(data_blk_nor);
-	raw_node->i.i_ext.len = cpu_to_le32(1);
+	raw_node->i.i_ext.blk_addr = 0;
+	raw_node->i.i_ext.len = 0;
 
 	main_area_node_seg_blk_offset = get_sb(main_blkaddr);
 	main_area_node_seg_blk_offset += config.cur_seg[CURSEG_HOT_NODE] *
@@ -825,20 +784,16 @@ static int f2fs_write_root_inode(void)
 		return -1;
 	}
 
-	memset(raw_node, 0xff, sizeof(struct f2fs_node));
-
 	/* avoid power-off-recovery based on roll-forward policy */
 	main_area_node_seg_blk_offset = get_sb(main_blkaddr);
 	main_area_node_seg_blk_offset += config.cur_seg[CURSEG_WARM_NODE] *
 					config.blks_per_seg;
-        main_area_node_seg_blk_offset *= blk_size_bytes;
 
-	DBG(1, "\tWriting root inode (warm node), at offset 0x%08"PRIx64"\n", main_area_node_seg_blk_offset);
-	if (dev_write(raw_node, main_area_node_seg_blk_offset, F2FS_BLKSIZE)) {
-		MSG(1, "\tError: While writing the raw_node to disk!!!\n");
+	if (discard_obsolete_dnode(raw_node, main_area_node_seg_blk_offset)) {
 		free(raw_node);
 		return -1;
 	}
+
 	free(raw_node);
 	return 0;
 }
@@ -858,15 +813,15 @@ static int f2fs_update_nat_root(void)
 	nat_blk->entries[get_sb(root_ino)].block_addr = cpu_to_le32(
 		get_sb(main_blkaddr) +
 		config.cur_seg[CURSEG_HOT_NODE] * config.blks_per_seg);
-	nat_blk->entries[get_sb(root_ino)].ino = sb.root_ino;
+	nat_blk->entries[get_sb(root_ino)].ino = sb->root_ino;
 
 	/* update node nat */
 	nat_blk->entries[get_sb(node_ino)].block_addr = cpu_to_le32(1);
-	nat_blk->entries[get_sb(node_ino)].ino = sb.node_ino;
+	nat_blk->entries[get_sb(node_ino)].ino = sb->node_ino;
 
 	/* update meta nat */
 	nat_blk->entries[get_sb(meta_ino)].block_addr = cpu_to_le32(1);
-	nat_blk->entries[get_sb(meta_ino)].ino = sb.meta_ino;
+	nat_blk->entries[get_sb(meta_ino)].ino = sb->meta_ino;
 
 	blk_size_bytes = 1 << get_sb(log_blocksize);
 	nat_seg_blk_offset = get_sb(nat_blkaddr);
@@ -895,19 +850,20 @@ static int f2fs_add_default_dentry_root(void)
 	}
 
 	dent_blk->dentry[0].hash_code = 0;
-	dent_blk->dentry[0].ino = sb.root_ino;
+	dent_blk->dentry[0].ino = sb->root_ino;
 	dent_blk->dentry[0].name_len = cpu_to_le16(1);
 	dent_blk->dentry[0].file_type = F2FS_FT_DIR;
 	memcpy(dent_blk->filename[0], ".", 1);
 
 	dent_blk->dentry[1].hash_code = 0;
-	dent_blk->dentry[1].ino = sb.root_ino;
+	dent_blk->dentry[1].ino = sb->root_ino;
 	dent_blk->dentry[1].name_len = cpu_to_le16(2);
 	dent_blk->dentry[1].file_type = F2FS_FT_DIR;
 	memcpy(dent_blk->filename[1], "..", 2);
 
 	/* bitmap for . and .. */
-	dent_blk->dentry_bitmap[0] = (1 << 1) | (1 << 0);
+	test_and_set_bit_le(0, dent_blk->dentry_bitmap);
+	test_and_set_bit_le(1, dent_blk->dentry_bitmap);
 	blk_size_bytes = 1 << get_sb(log_blocksize);
 	data_blk_offset = get_sb(main_blkaddr);
 	data_blk_offset += config.cur_seg[CURSEG_HOT_DATA] *
